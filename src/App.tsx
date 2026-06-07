@@ -9,8 +9,8 @@ export default function App() {
   const startStream = () => {
     if (!sourceUrl) return;
     const encoded = encodeURIComponent(sourceUrl);
-    // On dirige le flux vers notre proxy interne local (sans coupure)
-    setActiveStreamUrl(`/api/proxy/playlist.m3u8?url=${encoded}`);
+    // On utilise FFMPEG pour transcoder élégamment le flux iptv en direct et supprimer les erreurs de timestamps / coupures
+    setActiveStreamUrl(`/api/proxy/live.m3u8?url=${encoded}`);
   };
 
   const isLive = activeStreamUrl !== null;

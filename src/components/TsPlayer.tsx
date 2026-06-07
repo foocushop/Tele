@@ -20,13 +20,18 @@ export function TsPlayer({ streamUrl }: TsPlayerProps) {
     setHasError(false);
     setIsReady(false);
 
-    // Initialisation HLS.js
+    if (playerRef.current) {
+        playerRef.current.destroy();
+        playerRef.current = null;
+    }
+
     if (Hls.isSupported()) {
       const hls = new Hls({
-         // Paramètres pour un flux IPTV classique sans accélération artificielle
+         // Options douces : aucune accélération de la vitesse de lecture
          lowLatencyMode: false,
-         backBufferLength: 30, // Ne garde que 30s de passif pour économiser la RAM
-         liveSyncDurationCount: 3, // Synchronise avec un léger retard pour plus de stabilité
+         backBufferLength: 30, // Conserver peu de mémoire
+         liveSyncDurationCount: 3, 
+         // liveDurationInfinity supprimé pour forcer le comportement standard
       });
 
       playerRef.current = hls;
@@ -39,25 +44,24 @@ export function TsPlayer({ streamUrl }: TsPlayerProps) {
          video.play().catch(e => console.log('Autorisation lecture requise:', e));
       });
 
+      // Gestion agressive et transparente des erreurs
       hls.on(Hls.Events.ERROR, (event, data) => {
          if (data.fatal) {
            switch (data.type) {
              case Hls.ErrorTypes.NETWORK_ERROR:
-               console.warn('[HLS] Erreur réseau (fatal). Tentative de récupération...');
+               console.warn('[HLS] Erreur réseau. Reconnexion silencieuse...');
                hls.startLoad();
                break;
              case Hls.ErrorTypes.MEDIA_ERROR:
-               console.warn('[HLS] Erreur de média (timestamp/discontinuité fatal). Récupération...');
+               console.warn('[HLS] Discontinuité (rollback de timestamps). Lissage...');
                hls.recoverMediaError();
                break;
              default:
-               console.error('[HLS] Erreur irrécupérable.');
+               console.error('[HLS] Erreur majeure. Redémarrage...');
                hls.destroy();
                setHasError(true);
                break;
            }
-         } else {
-             console.warn('[HLS] Erreur non fatale:', data);
          }
       });
 

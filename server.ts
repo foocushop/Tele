@@ -1,6 +1,21 @@
 import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
+import fs from 'fs';
+import crypto from 'crypto';
+import ffmpeg from 'fluent-ffmpeg';
+import ffmpegPath from 'ffmpeg-static';
+
+// Provide absolute path to ffmpeg binary
+if (ffmpegPath) {
+  ffmpeg.setFfmpegPath(ffmpegPath);
+}
+
+// Store active ffmpeg processes to kill them gracefully when users stop watching
+const activeStreams = new Map<string, {
+    process: ffmpeg.FfmpegCommand,
+    timeout: NodeJS.Timeout
+}>();
 
 async function startServer() {
   const app = express();
@@ -17,7 +32,118 @@ async function startServer() {
     next();
   });
 
-  // Proxy TS Seamless (Pont Transparent)
+  // ========== FLUX HLS ROBUSTE VIA FFMPEG (SUPPRIME LES ROLLBACKS) ==========
+  app.get('/api/proxy/live.m3u8', (req, res) => {
+    const targetUrl = req.query.url as string;
+    if (!targetUrl) return res.status(400).send("No url provided");
+
+    const streamId = crypto.createHash('md5').update(targetUrl).digest('hex');
+    const hlsDir = path.join('/tmp', 'hls', streamId);
+    const m3u8Path = path.join(hlsDir, 'stream.m3u8');
+
+    // Create the directory if it doesn't exist
+    if (!fs.existsSync(hlsDir)) {
+        fs.mkdirSync(hlsDir, { recursive: true });
+    }
+
+    // Function to kill stream on inactivity
+    const resetTimeout = () => {
+        if (activeStreams.has(streamId)) {
+            const streamParam = activeStreams.get(streamId)!;
+            clearTimeout(streamParam.timeout);
+            streamParam.timeout = setTimeout(() => {
+                console.log(`[FFMPEG] Arrêt du stream inactif : ${streamId}`);
+                streamParam.process.kill('SIGKILL');
+                activeStreams.delete(streamId);
+                // Cleanup files
+                fs.rmSync(hlsDir, { recursive: true, force: true });
+            }, 30000); // 30 seconds of inactivity -> stop process
+        }
+    };
+
+    if (!activeStreams.has(streamId)) {
+        console.log(`[FFMPEG] Démarrage du transcodage HLS en direct pour : ${streamId}`);
+        // We ensure any old files are deleted so we don't serve dead segments
+        fs.rmSync(hlsDir, { recursive: true, force: true });
+        fs.mkdirSync(hlsDir, { recursive: true });
+
+        const command = ffmpeg()
+            .input(targetUrl)
+            // Options pour rendre la lecture HTTP très résiliente aux coupures du fournisseur
+            .inputOptions([
+                '-reconnect 1',
+                '-reconnect_at_eof 1', 
+                '-reconnect_streamed 1',
+                '-reconnect_delay_max 5',
+                '-y' // overwrite
+            ])
+            .outputOptions([
+                '-c copy',                     // On ne re-encode pas (économise CPU massivement)
+                '-f hls',                      // Format de sortie Apple HLS
+                '-hls_time 4',                 // Segments de 4 secondes (faible latence)
+                '-hls_list_size 5',            // Playlist de taille 5
+                '-hls_flags delete_segments+append_list+omit_endlist', // Rotation propre des segments
+                '-hls_segment_type mpegts',    // Force .ts output
+                `-hls_base_url /api/proxy/${streamId}/` // Chemin absolu pour les segments
+            ])
+            .output(m3u8Path)
+            .on('error', (err) => {
+                console.error(`[FFMPEG] Erreur: ${err.message}`);
+                activeStreams.delete(streamId);
+            });
+
+        command.run();
+
+        activeStreams.set(streamId, {
+            process: command,
+            // Timeout that will be reset on every m3u8 poll
+            timeout: setTimeout(() => {}, 0) 
+        });
+        resetTimeout();
+
+        // On patiente quelques secondes que FFMPEG écrive le premier segment
+        let checkCount = 0;
+        const checkInterval = setInterval(() => {
+            if (fs.existsSync(m3u8Path)) {
+                clearInterval(checkInterval);
+                res.sendFile(m3u8Path);
+            } else {
+                checkCount++;
+                if (checkCount > 40) { // Timeout after 10 seconds
+                    clearInterval(checkInterval);
+                    res.status(500).send("FFmpeg failed to start stream quickly enough.");
+                }
+            }
+        }, 250);
+        return;
+    }
+
+    // FFMPEG process is active, just reset timeout and serve the latest playlist
+    resetTimeout();
+    
+    if (fs.existsSync(m3u8Path)) {
+        res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        res.sendFile(m3u8Path);
+    } else {
+        res.status(404).send("Playlist not ready yet.");
+    }
+  });
+
+  // ========== FOURNISSEUR STATIQUE POUR LES SEGMENTS .TS ==========
+  app.get('/api/proxy/:streamId/:segmentFile', (req, res) => {
+      const { streamId, segmentFile } = req.params;
+      const filePath = path.join('/tmp', 'hls', streamId, segmentFile);
+      if (fs.existsSync(filePath)) {
+          res.setHeader('Content-Type', 'video/MP2T');
+          res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+          res.sendFile(filePath);
+      } else {
+          res.status(404).end();
+      }
+  });
+
+  // Proxy TS Seamless (Pont Transparent) - Gardé pour la compatibilité
   app.get('/api/proxy/stream.ts', (req, res) => {
     const targetUrl = req.query.url as string;
     if (!targetUrl) return res.status(400).send("Veuillez fournir une URL source.");
@@ -81,88 +207,6 @@ async function startServer() {
     }
 
     streamLoop();
-  });
-
-  // Flux HLS Dynamique (M3U8) avec gestion de la discontinuité
-  let globalEpochSequence = Math.floor(Date.now() / 20000);
-  
-  app.get('/api/proxy/playlist.m3u8', (req, res) => {
-    const targetUrl = req.query.url as string;
-    if (!targetUrl) return res.status(400).send("No url provided");
-    
-    // Déclare un flux en direct (Fenêtre glissante de 3 segments de 20s)
-    const segmentDuration = 20; // 20 secondes, temps moyen d'une coupure iptv
-    const currentSeq = Math.floor(Date.now() / 1000 / segmentDuration);
-    
-    let m3u8 = "#EXTM3U\n";
-    m3u8 += "#EXT-X-VERSION:3\n";
-    m3u8 += `#EXT-X-TARGETDURATION:${segmentDuration}\n`;
-    m3u8 += `#EXT-X-MEDIA-SEQUENCE:${currentSeq - 2}\n`; // 3 segments dans le passé
-    
-    // Segment le plus ancien
-    m3u8 += "#EXT-X-DISCONTINUITY\n";
-    m3u8 += `#EXTINF:${segmentDuration}.000,\n`;
-    m3u8 += `/api/proxy/segment.ts?url=${encodeURIComponent(targetUrl)}&seq=${currentSeq - 2}\n`;
-    
-    // Segment du milieu
-    m3u8 += "#EXT-X-DISCONTINUITY\n";
-    m3u8 += `#EXTINF:${segmentDuration}.000,\n`;
-    m3u8 += `/api/proxy/segment.ts?url=${encodeURIComponent(targetUrl)}&seq=${currentSeq - 1}\n`;
-    
-    // Segment le plus récent
-    m3u8 += "#EXT-X-DISCONTINUITY\n";
-    m3u8 += `#EXTINF:${segmentDuration}.000,\n`;
-    m3u8 += `/api/proxy/segment.ts?url=${encodeURIComponent(targetUrl)}&seq=${currentSeq}\n`;
-    
-    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-    res.send(m3u8);
-  });
-
-  // Gestion des mini-segments TS pour HLS.js
-  const activeSegments = new Map<string, Date>(); // Pour éviter l'abus de requêtes
-  
-  app.get('/api/proxy/segment.ts', async (req, res) => {
-      const targetUrl = req.query.url as string;
-      const seq = req.query.seq as string;
-      if (!targetUrl) return res.status(400).send("No url");
-
-      res.setHeader('Content-Type', 'video/MP2T');
-      res.setHeader('Connection', 'close'); // On coupe à la fin du segment
-      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-      res.setHeader('X-Accel-Buffering', 'no');
-
-      const abortController = new AbortController();
-      req.on('close', () => abortController.abort());
-
-      try {
-          const response = await fetch(targetUrl, {
-              signal: abortController.signal,
-              headers: {
-                  'User-Agent': 'VLC/3.0.16 LibVLC/3.0.16',
-                  'Accept': '*/*'
-              }
-          });
-
-          if (!response.ok) return res.status(500).end();
-          if (!response.body) return res.status(500).end();
-
-          const reader = response.body.getReader();
-          let startTime = Date.now();
-          
-          while (true) {
-              // Si 20 secondes se sont écoulées, on coupe pour simuler la fin du segment
-              if (Date.now() - startTime > 20000) {
-                  break; 
-              }
-              const { done, value } = await reader.read();
-              if (done) break; // Le fournisseur a coupé plus tôt que prévu
-              res.write(value);
-          }
-          res.end();
-      } catch (err: any) {
-          res.end();
-      }
   });
 
   // Setup Vite Middleware React
