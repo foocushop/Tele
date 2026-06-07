@@ -22,21 +22,17 @@ async function startServer() {
     const targetUrl = req.query.url as string;
     if (!targetUrl) return res.status(400).send("Veuillez fournir une URL source.");
 
-    // Headers cruciaux pour le streaming vidéo en direct et le contournement des proxies
     res.setHeader('Content-Type', 'video/MP2T');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
-    
-    // TRÈS IMPORTANT: Désactive la mise en mémoire tampon des reverse-proxies (Nginx, etc.)
-    // C'est ce qui causait le "chargement infini qui tourne en rond" !
     res.setHeader('X-Accel-Buffering', 'no');
 
     let isClientConnected = true;
+    const abortController = new AbortController();
 
     req.on('close', () => {
         isClientConnected = false;
+        abortController.abort(); // IMPORTANT! Cancel the fetch.
         console.log('[Serveur] Lecteur Web déconnecté.');
     });
 
@@ -45,27 +41,25 @@ async function startServer() {
     async function streamLoop() {
         while (isClientConnected) {
             try {
-                // On imite un lecteur VLC pour passer les blocages IPTV
                 const response = await fetch(targetUrl, {
+                    signal: abortController.signal,
                     headers: {
                         'User-Agent': 'VLC/3.0.16 LibVLC/3.0.16',
-                        'Accept': '*/*',
-                        'Connection': 'keep-alive'
+                        'Accept': '*/*'
                     }
                 });
 
                 if (!response.ok) {
                     throw new Error(`HTTP Error: ${response.status}`);
                 }
-                
                 if (!response.body) throw new Error("Body vide");
 
                 const reader = response.body.getReader();
 
                 while (isClientConnected) {
                     const { done, value } = await reader.read();
-                    if (done) break; // Le fournisseur IPTV a coupé ! On sort de la boucle interne
-                    res.write(value); // Envoi direct au navigateur sans attendre
+                    if (done) break; 
+                    res.write(value); 
                 }
                 
                 if (isClientConnected) {
@@ -73,17 +67,102 @@ async function startServer() {
                 }
                 
             } catch (err: any) {
+                if (err.name === 'AbortError') {
+                    console.log('[Serveur] Connexion annulée proprement.');
+                    break;
+                }
                 if (isClientConnected) {
                     console.error('[Serveur] Erreur de lecture HTTP:', err.message);
-                    // Petite pause en cas d'erreur réseau avant de re-tenter la connexion
-                    await new Promise(r => setTimeout(r, 1000));
+                    await new Promise(r => setTimeout(r, 1500));
                 }
             }
         }
-        res.end(); // On ferme proprement si le client quitte la page
+        res.end();
     }
 
     streamLoop();
+  });
+
+  // Flux HLS Dynamique (M3U8) avec gestion de la discontinuité
+  let globalEpochSequence = Math.floor(Date.now() / 20000);
+  
+  app.get('/api/proxy/playlist.m3u8', (req, res) => {
+    const targetUrl = req.query.url as string;
+    if (!targetUrl) return res.status(400).send("No url provided");
+    
+    // Déclare un flux en direct (Fenêtre glissante de 3 segments de 20s)
+    const segmentDuration = 20; // 20 secondes, temps moyen d'une coupure iptv
+    const currentSeq = Math.floor(Date.now() / 1000 / segmentDuration);
+    
+    let m3u8 = "#EXTM3U\n";
+    m3u8 += "#EXT-X-VERSION:3\n";
+    m3u8 += `#EXT-X-TARGETDURATION:${segmentDuration}\n`;
+    m3u8 += `#EXT-X-MEDIA-SEQUENCE:${currentSeq - 2}\n`; // 3 segments dans le passé
+    
+    // Segment le plus ancien
+    m3u8 += "#EXT-X-DISCONTINUITY\n";
+    m3u8 += `#EXTINF:${segmentDuration}.000,\n`;
+    m3u8 += `/api/proxy/segment.ts?url=${encodeURIComponent(targetUrl)}&seq=${currentSeq - 2}\n`;
+    
+    // Segment du milieu
+    m3u8 += "#EXT-X-DISCONTINUITY\n";
+    m3u8 += `#EXTINF:${segmentDuration}.000,\n`;
+    m3u8 += `/api/proxy/segment.ts?url=${encodeURIComponent(targetUrl)}&seq=${currentSeq - 1}\n`;
+    
+    // Segment le plus récent
+    m3u8 += "#EXT-X-DISCONTINUITY\n";
+    m3u8 += `#EXTINF:${segmentDuration}.000,\n`;
+    m3u8 += `/api/proxy/segment.ts?url=${encodeURIComponent(targetUrl)}&seq=${currentSeq}\n`;
+    
+    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.send(m3u8);
+  });
+
+  // Gestion des mini-segments TS pour HLS.js
+  const activeSegments = new Map<string, Date>(); // Pour éviter l'abus de requêtes
+  
+  app.get('/api/proxy/segment.ts', async (req, res) => {
+      const targetUrl = req.query.url as string;
+      const seq = req.query.seq as string;
+      if (!targetUrl) return res.status(400).send("No url");
+
+      res.setHeader('Content-Type', 'video/MP2T');
+      res.setHeader('Connection', 'close'); // On coupe à la fin du segment
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      res.setHeader('X-Accel-Buffering', 'no');
+
+      const abortController = new AbortController();
+      req.on('close', () => abortController.abort());
+
+      try {
+          const response = await fetch(targetUrl, {
+              signal: abortController.signal,
+              headers: {
+                  'User-Agent': 'VLC/3.0.16 LibVLC/3.0.16',
+                  'Accept': '*/*'
+              }
+          });
+
+          if (!response.ok) return res.status(500).end();
+          if (!response.body) return res.status(500).end();
+
+          const reader = response.body.getReader();
+          let startTime = Date.now();
+          
+          while (true) {
+              // Si 20 secondes se sont écoulées, on coupe pour simuler la fin du segment
+              if (Date.now() - startTime > 20000) {
+                  break; 
+              }
+              const { done, value } = await reader.read();
+              if (done) break; // Le fournisseur a coupé plus tôt que prévu
+              res.write(value);
+          }
+          res.end();
+      } catch (err: any) {
+          res.end();
+      }
   });
 
   // Setup Vite Middleware React

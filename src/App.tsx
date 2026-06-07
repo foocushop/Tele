@@ -10,7 +10,7 @@ export default function App() {
     if (!sourceUrl) return;
     const encoded = encodeURIComponent(sourceUrl);
     // On dirige le flux vers notre proxy interne local (sans coupure)
-    setActiveStreamUrl(`/api/proxy/stream.ts?url=${encoded}`);
+    setActiveStreamUrl(`/api/proxy/playlist.m3u8?url=${encoded}`);
   };
 
   const isLive = activeStreamUrl !== null;

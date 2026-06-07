@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import mpegts from 'mpegts.js';
+import Hls from 'hls.js';
 import { Loader2, AlertCircle } from 'lucide-react';
 
 interface TsPlayerProps {
@@ -8,7 +8,7 @@ interface TsPlayerProps {
 
 export function TsPlayer({ streamUrl }: TsPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const playerRef = useRef<mpegts.Player | null>(null);
+  const playerRef = useRef<Hls | null>(null);
   
   const [isReady, setIsReady] = useState(false);
   const [hasError, setHasError] = useState(false);
@@ -20,54 +20,57 @@ export function TsPlayer({ streamUrl }: TsPlayerProps) {
     setHasError(false);
     setIsReady(false);
 
-    // Nettoyage de l'ancien lecteur si nécessaire
-    if (playerRef.current) {
-        playerRef.current.destroy();
-        playerRef.current = null;
-    }
-
-    if (mpegts.getFeatureList().mseLivePlayback) {
-      // Optimisation pour streaming continu en direct
-      const player = mpegts.createPlayer({
-        type: 'm2ts', // m2ts = MPEG2-TS (IPTV)
-        isLive: true,
-        url: streamUrl,
-      }, {
-        enableWorker: true,            // Performant pour la vidéo
-        enableStashBuffer: false,      // Empêche le buffering infini
-        stashInitialSize: 128,         
-        liveBufferLatencyChasing: true, // Aide à rester "En direct"
+    // Initialisation HLS.js
+    if (Hls.isSupported()) {
+      const hls = new Hls({
+         // Paramètres pour un live ultra agressif (IPTV proxy local)
+         lowLatencyMode: true,
+         backBufferLength: 30, // Ne garde que 30s de passif pour économiser la RAM
+         liveDurationInfinity: true,
+         maxLiveSyncPlaybackRate: 1.5,
       });
 
-      playerRef.current = player;
-      player.attachMediaElement(video);
-      player.load();
-      
-      player.on(mpegts.Events.ERROR, (errType, errDetail) => {
-         console.warn('MPEG-TS Erreur ou Reconnexion:', errType, errDetail);
-         // Auto-recovery brutal si le lecteur freeze
-         if (playerRef.current) {
-             playerRef.current.unload();
-             playerRef.current.load();
-             playerRef.current.play().catch(() => {});
+      playerRef.current = hls;
+      hls.loadSource(streamUrl);
+      hls.attachMedia(video);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+         setIsReady(true);
+         setHasError(false);
+         video.play().catch(e => console.log('Autorisation lecture requise:', e));
+      });
+
+      hls.on(Hls.Events.ERROR, (event, data) => {
+         if (data.fatal) {
+           switch (data.type) {
+             case Hls.ErrorTypes.NETWORK_ERROR:
+               console.warn('[HLS] Erreur réseau (fatal). Tentative de récupération...');
+               hls.startLoad();
+               break;
+             case Hls.ErrorTypes.MEDIA_ERROR:
+               console.warn('[HLS] Erreur de média (timestamp/discontinuité fatal). Récupération...');
+               hls.recoverMediaError();
+               break;
+             default:
+               console.error('[HLS] Erreur irrécupérable.');
+               hls.destroy();
+               setHasError(true);
+               break;
+           }
+         } else {
+             console.warn('[HLS] Erreur non fatale:', data);
          }
       });
 
-      player.on(mpegts.Events.MEDIA_INFO, () => {
-         setIsReady(true);
-         setHasError(false);
-         video.play().catch(e => console.log('Autorisation lecture requise (cliquez Play):', e));
-      });
-
       return () => {
-        player.destroy();
+        hls.destroy();
         playerRef.current = null;
       };
     } 
-    // Fallback Mac Safari / iOS natif
-    else if (video.canPlayType('application/vnd.apple.mpegurl') || video.canPlayType('video/mp2t')) {
+    // Fallback Apple (Safari/iOS) natif
+    else if (video.canPlayType('application/vnd.apple.mpegurl')) {
       video.src = streamUrl;
-      video.addEventListener('canplay', () => {
+      video.addEventListener('loadedmetadata', () => {
         setIsReady(true);
         video.play().catch(() => {});
       });
