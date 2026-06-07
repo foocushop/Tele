@@ -1,15 +1,12 @@
 import React, { useEffect, useRef, useState } from 'react';
 import mpegts from 'mpegts.js';
 import { Loader2, AlertCircle } from 'lucide-react';
-import { cn } from '../lib/utils';
 
 interface TsPlayerProps {
-  tsUrl: string;
-  m3u8Url: string;
-  autoPlay?: boolean;
+  streamUrl: string;
 }
 
-export function TsPlayer({ tsUrl, m3u8Url, autoPlay = true }: TsPlayerProps) {
+export function TsPlayer({ streamUrl }: TsPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const playerRef = useRef<mpegts.Player | null>(null);
   
@@ -18,33 +15,28 @@ export function TsPlayer({ tsUrl, m3u8Url, autoPlay = true }: TsPlayerProps) {
 
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || !tsUrl) return;
+    if (!video || !streamUrl) return;
 
     setHasError(false);
     setIsReady(false);
 
-    // Destructuration de l'ancien lecteur si existant
+    // Nettoyage de l'ancien lecteur si nécessaire
     if (playerRef.current) {
         playerRef.current.destroy();
         playerRef.current = null;
     }
 
     if (mpegts.getFeatureList().mseLivePlayback) {
-      // Configuration optimale pour MPEG-TS Continu (IPTV)
+      // Optimisation pour streaming continu en direct
       const player = mpegts.createPlayer({
-        type: 'm2ts', // m2ts = MPEG2-TS brut
+        type: 'm2ts', // m2ts = MPEG2-TS (IPTV)
         isLive: true,
-        hasAudio: true,
-        hasVideo: true,
-        url: tsUrl
+        url: streamUrl,
       }, {
-        enableWorker: true,
-        enableStashBuffer: false, // Empêche le buffering infini
-        stashInitialSize: 128,
-        lazyLoadMaxDuration: 3 * 60,
-        seekType: 'range',
-        liveBufferLatencyChasing: true, // Aide à rattraper si décalage
-        liveBufferLatencyMaxLatency: 2.5, // Force la lecture si la latence dépasse 2.5s
+        enableWorker: true,            // Performant pour la vidéo
+        enableStashBuffer: false,      // Empêche le buffering infini
+        stashInitialSize: 128,         
+        liveBufferLatencyChasing: true, // Aide à rester "En direct"
       });
 
       playerRef.current = player;
@@ -52,8 +44,8 @@ export function TsPlayer({ tsUrl, m3u8Url, autoPlay = true }: TsPlayerProps) {
       player.load();
       
       player.on(mpegts.Events.ERROR, (errType, errDetail) => {
-         console.warn('MPEG-TS Erreur (Tentative de reconnexion auto):', errType, errDetail);
-         // Plutôt que de planter, on tente une re-synchronisation transparente locale
+         console.warn('MPEG-TS Erreur ou Reconnexion:', errType, errDetail);
+         // Auto-recovery brutal si le lecteur freeze
          if (playerRef.current) {
              playerRef.current.unload();
              playerRef.current.load();
@@ -64,9 +56,7 @@ export function TsPlayer({ tsUrl, m3u8Url, autoPlay = true }: TsPlayerProps) {
       player.on(mpegts.Events.MEDIA_INFO, () => {
          setIsReady(true);
          setHasError(false);
-         if (autoPlay) {
-           video.play().catch(e => console.log('Autorisation lecture requise:', e));
-         }
+         video.play().catch(e => console.log('Autorisation lecture requise (cliquez Play):', e));
       });
 
       return () => {
@@ -74,46 +64,41 @@ export function TsPlayer({ tsUrl, m3u8Url, autoPlay = true }: TsPlayerProps) {
         playerRef.current = null;
       };
     } 
-    // Fallback Natif Safari (Mac/iOS gèrent le TS/HLS facilement)
-    else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = m3u8Url;
+    // Fallback Mac Safari / iOS natif
+    else if (video.canPlayType('application/vnd.apple.mpegurl') || video.canPlayType('video/mp2t')) {
+      video.src = streamUrl;
       video.addEventListener('canplay', () => {
         setIsReady(true);
-        if (autoPlay) {
-          video.play().catch(() => {});
-        }
+        video.play().catch(() => {});
       });
       video.addEventListener('error', () => setHasError(true));
     } else {
       setHasError(true);
     }
-  }, [tsUrl, m3u8Url, autoPlay]);
+  }, [streamUrl]);
 
   return (
-    <div className="relative group overflow-hidden rounded-xl border border-[#1F2833] bg-black aspect-video shadow-2xl">
+    <div className="absolute inset-0 w-full h-full bg-black">
       {!isReady && !hasError && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#0B0C10]/80 backdrop-blur-sm z-10 text-[#45A29E] gap-3">
-          <Loader2 className="w-8 h-8 animate-spin text-[#66FCF1]" />
-          <span className="font-medium text-xs uppercase tracking-widest">Mise en mémoire tampon...</span>
+        <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#0B0C10]/90 backdrop-blur z-10 text-[#45A29E] gap-4">
+          <Loader2 className="w-10 h-10 animate-spin text-[#66FCF1]" />
+          <span className="font-bold text-[10px] uppercase tracking-widest text-[#66FCF1]">Connexion et Lissage du Flux...</span>
         </div>
       )}
+      
       {hasError && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center bg-red-950/80 backdrop-blur-md z-10 text-center gap-2 p-6">
-          <AlertCircle className="w-10 h-10 mb-2 text-red-400" />
-          <h3 className="text-xs uppercase tracking-widest font-bold text-red-400">Erreur de Lecteur</h3>
-          <p className="text-sm opacity-80 max-w-sm text-red-200">
-             Le navigateur ne supporte pas ce décodage ou les données sont corrompues. Utilisez VLC en copiant le lien généré.
-          </p>
+        <div className="absolute inset-0 flex items-center justify-center bg-red-950/90 backdrop-blur z-10 p-6 text-center">
+             <AlertCircle className="w-6 h-6 mr-3 text-red-500" />
+             <span className="text-xs uppercase tracking-widest font-bold text-red-500">Flux Incompatible (Vérifiez le lien)</span>
         </div>
       )}
+
+      {/* Vidéo intégrée */}
       <video
         ref={videoRef}
         controls
         playsInline
-        className={cn(
-          "w-full h-full object-contain transition-opacity duration-700",
-          !isReady ? "opacity-0" : "opacity-100"
-        )}
+        className={`w-full h-full object-contain transition-opacity duration-1000 ${!isReady ? 'opacity-0' : 'opacity-100'}`}
       />
     </div>
   );
