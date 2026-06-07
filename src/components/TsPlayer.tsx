@@ -23,11 +23,10 @@ export function TsPlayer({ streamUrl }: TsPlayerProps) {
     // Initialisation HLS.js
     if (Hls.isSupported()) {
       const hls = new Hls({
-         // Paramètres pour un live ultra agressif (IPTV proxy local)
-         lowLatencyMode: true,
+         // Paramètres pour un flux IPTV classique sans accélération artificielle
+         lowLatencyMode: false,
          backBufferLength: 30, // Ne garde que 30s de passif pour économiser la RAM
-         liveDurationInfinity: true,
-         maxLiveSyncPlaybackRate: 1.5,
+         liveSyncDurationCount: 3, // Synchronise avec un léger retard pour plus de stabilité
       });
 
       playerRef.current = hls;
