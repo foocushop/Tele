@@ -1,0 +1,6 @@
+{
+  "name": "Live M3U8 HLS Generator",
+  "description": "Système de diffusion et lecture qui transforme un morceau TS en playlist M3U8 continue avec un cache contrôlé.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
